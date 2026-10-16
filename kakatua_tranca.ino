@@ -1,23 +1,33 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
 // ─── Configurações de Rede e API ────────────────────────
-const char* ssid = "NOME DO WIFI DE ACESSO";
-const char* password = "SENHA DO WIFI DE ACESSO";
-const char* apiKey = "insira API KEY AQUI";
+const char* ssid = "Nome do WIfi";
+const char* password = "Senha do Wifi";
+const char* apiKey = "Api key";
 const char* urlEstacao = "https://esp32.chobi.com.br/api/sensor/estacao/";
 const char* urlTranca = "https://esp32.chobi.com.br/api/sensor/acesso/";
 
-// ─── Configurações do Sensor e LED ──────────────────────
+// ─── LED ────────────────────────────────────────────────
 const int LED = 21;
-const int pinoTrig = 13;
-const int pinoEcho = 14;
 
-// ─── Controle de Estado ─────────────────────────────────
-bool trancaBloqueada = true;
+// ─── Estrutura de cada tranca/sensor ────────────────────
+struct Tranca {
+  int id;
+  int pinoTrig;
+  int pinoEcho;
+  bool ocupada;   // antes: trancaBloqueada
+};
 
-// ─── Funções de comunicação ──────────────────────────────
+Tranca trancas[] = {
+  {1, 13, 14, true},
+  {2, 18, 19, true}
+};
+const int NUM_TRANCAS = sizeof(trancas) / sizeof(trancas[0]);
+
+// ─── Funções de comunicação ─────────────────────────────
 void setEstacao(bool bloqueada) {
   HTTPClient http;
   http.begin(urlEstacao);
@@ -62,21 +72,50 @@ void setTranca(int id_tranca, String estado, bool reservada) {
   http.end();
 }
 
-// ─── Funções de Ação ─────────────────────────────────────
-void trancar() {
-  Serial.println("\n>>> Objeto detectado pelo sensor! Trancando a estacao...");
-  setTranca(1, "fechada", false);
-  setEstacao(true);
-  trancaBloqueada = true;
+// ─── Leitura de distância (reutilizável p/ qualquer sensor) ──
+float lerDistanciaCm(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  long duracao = pulseIn(echo, HIGH, 30000);  // timeout 30 ms
+  return duracao * 0.034 / 2;                 // 0 se não houve eco
 }
 
-// ─── Setup ───────────────────────────────────────────────
+// ─── Estação só fica bloqueada se TODAS as trancas estiverem ocupadas ──
+bool todasOcupadas() {
+  for (int i = 0; i < NUM_TRANCAS; i++) {
+    if (!trancas[i].ocupada) return false;
+  }
+  return true;
+}
+
+// ─── Ações por tranca ───────────────────────────────────
+void trancar(Tranca &t) {
+  Serial.printf("\n>>> Tranca %d: objeto detectado! Trancando...\n", t.id);
+  setTranca(t.id, "fechada", false);
+  t.ocupada = true;
+  setEstacao(todasOcupadas());
+}
+
+void liberar(Tranca &t) {
+  Serial.printf("\n>>> Tranca %d: sensor livre! Liberando...\n", t.id);
+  setTranca(t.id, "aberta", false);
+  t.ocupada = false;
+  setEstacao(false);   // se uma está livre, a estação não está cheia
+}
+
+// ─── Setup ──────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-
   pinMode(LED, OUTPUT);
-  pinMode(pinoTrig, OUTPUT);
-  pinMode(pinoEcho, INPUT);
+
+  for (int i = 0; i < NUM_TRANCAS; i++) {
+    pinMode(trancas[i].pinoTrig, OUTPUT);
+    pinMode(trancas[i].pinoEcho, INPUT);
+  }
 
   WiFi.begin(ssid, password);
   Serial.print("Conectando ao WiFi");
@@ -86,46 +125,30 @@ void setup() {
   }
   Serial.println(" Conectado!");
   Serial.println("-------------------------------------");
-  Serial.println("Aguardando deteccao por sensor ultrassonico...");
+  Serial.println("Aguardando deteccao por sensores ultrassonicos...");
   Serial.println("-------------------------------------");
 }
 
-// ─── Loop ────────────────────────────────────────────────
+// ─── Loop ───────────────────────────────────────────────
 void loop() {
-  // 1. Dispara o pulso ultrassônico
-  digitalWrite(pinoTrig, LOW);
-  delayMicroseconds(2);
-  digitalWrite(pinoTrig, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(pinoTrig, LOW);
+  bool algumDetectado = false;
 
-  // 2. Lê o tempo de retorno e calcula a distância
-  long duracao = pulseIn(pinoEcho, HIGH);
-  float distanciaCm = duracao * 0.034 / 2;
+  for (int i = 0; i < NUM_TRANCAS; i++) {
+    Tranca &t = trancas[i];
+    float dist = lerDistanciaCm(t.pinoTrig, t.pinoEcho);
 
-  Serial.printf("[Sensor] Distancia: %.1f cm | Tranca: %s\n", 
-    distanciaCm, 
-    trancaBloqueada ? "BLOQUEADA" : "LIVRE");
+    Serial.printf("[Sensor %d] %.1f cm | %s\n", t.id, dist,
+                  t.ocupada ? "OCUPADA" : "LIVRE");
 
-  // 3. Objeto detectado → trava
-  if (distanciaCm > 0 && distanciaCm <= 10) {
-    digitalWrite(LED, HIGH);
+    bool detectado = (dist > 0 && dist <= 10);
+    if (detectado) algumDetectado = true;
 
-    if (!trancaBloqueada) {
-      trancar();
-    }
+    if (detectado && !t.ocupada)      trancar(t);
+    else if (!detectado && t.ocupada) liberar(t);
 
-  // 4. Sem objeto → libera
-  } else {
-    digitalWrite(LED, LOW);
-
-    if (trancaBloqueada) {
-      Serial.println("\n>>> Sensor livre! Desbloqueando a estacao...");
-      setTranca(1, "aberta", false);
-      setEstacao(false);
-      trancaBloqueada = false;
-    }
+    delay(50);  // evita um sensor captar o eco do outro
   }
 
+  digitalWrite(LED, algumDetectado ? HIGH : LOW);
   delay(100);
 }
