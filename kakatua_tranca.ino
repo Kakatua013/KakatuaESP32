@@ -20,7 +20,7 @@ const int LED = 21;
 // Se o seu módulo de relé for ativo em baixo, troque os dois valores.
 #define SOLE_ATIVO   HIGH
 #define SOLE_REPOUSO LOW
-const unsigned long TEMPO_PULSO_MS = 500;   // quanto tempo a solenoide fica acionada
+const unsigned long TEMPO_PULSO_MS = 5000;   // quanto tempo a solenoide fica acionada
 
 // ─── Consulta de comandos ───────────────────────────────
 const unsigned long INTERVALO_POLL_MS = 1000;  // uma tranca consultada a cada 1 s (revezando)
