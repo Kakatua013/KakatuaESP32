@@ -1,78 +1,227 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-// ─── Configurações de Rede e API ────────────────────────
-const char* ssid = "Nome do Wifi";
-const char* password = "Senha do Wifi";
-const char* apiKey = "API key";
-const char* urlEstacao = "https://esp32.chobi.com.br/api/sensor/estacao/";
-const char* urlTranca = "https://esp32.chobi.com.br/api/sensor/acesso/";
-// GET .../tranca/<id>/ -> usado para ler o comando pendente de cada tranca
-const char* urlConsultaTranca = "https://esp32.chobi.com.br/api/sensor/tranca/";
+// ═══ CONFIGURAÇÃO ═══════════════════════════════════════════════════════════
 
-// ─── LED ────────────────────────────────────────────────
+// Portal de configuração (WiFi e API key ficam salvos na memória do ESP)
+const char* NOME_PORTAL  = "Kakatua-Config";   // nome da rede que o ESP cria
+const char* SENHA_PORTAL = "kakatua123";       // senha dessa rede (mínimo 8 caracteres)
+const int PINO_CONFIG = 0;                     // botão BOOT: segure 3 s para reabrir o portal
+const unsigned long TEMPO_BOTAO_MS = 3000;
+
+// Servidor. Use UMA das duas linhas:
+//  A) Domínio com HTTPS (precisa de internet; se o ESP estiver na MESMA rede do servidor
+//     e der erro de conexão, o roteador pode não suportar "NAT loopback": use a opção B).
+//  B) IP do servidor na MESMA rede do ESP, HTTP direto: mais simples e bem mais rápido.
+const char* API_BASE = "https://esp32.chobi.com.br/api/sensor";
+// const char* API_BASE = "http://192.168.15.4:8000/api/sensor";
+
+// LED
 const int LED = 21;
 
-// ─── Solenoides ─────────────────────────────────────────
-// Nível que ACIONA a solenoide (HIGH p/ MOSFET ou módulo relé ativo em alto).
+// Solenoides: nível que ACIONA (HIGH p/ MOSFET ou relé ativo em alto).
 // Se o seu módulo de relé for ativo em baixo, troque os dois valores.
 #define SOLE_ATIVO   HIGH
 #define SOLE_REPOUSO LOW
 const unsigned long TEMPO_PULSO_MS = 5000;   // quanto tempo a solenoide fica acionada
 
-// ─── Consulta de comandos ───────────────────────────────
-const unsigned long INTERVALO_POLL_MS = 1000;  // uma tranca consultada a cada 1 s (revezando)
+// Sensores: histerese + confirmação, para não ficar "pulando" entre livre e ocupada.
+const float   DIST_OCUPADA_CM = 10.0;   // até aqui = ocupada
+const float   DIST_LIVRE_CM   = 14.0;   // daqui pra cima (ou sem eco) = livre
+const uint8_t CONFIRMACOES    = 3;      // leituras seguidas iguais para aceitar a mudança
+const bool    DEBUG_LEITURAS  = true;   // mostra no Serial as 3 leituras brutas de cada sensor
+
+// Envio ao servidor
+const unsigned long RETRY_MS     = 10000;   // se o envio falhar, tenta de novo depois disso
+const unsigned long HEARTBEAT_MS = 0;       // 0 = só envia quando muda. Ex.: 60000 reenvia a cada 60 s
+                                            // (cuidado: o envio manda tranca_reservada=false)
+const unsigned long OFFLINE_REINICIA_MS = 300000;  // reinicia o ESP se ficar 5 min sem WiFi
+
+// Consulta de comandos
+const unsigned long INTERVALO_POLL_MS = 1000;   // uma tranca consultada a cada 1 s (revezando)
+
+// ═══ ESTADO GLOBAL ══════════════════════════════════════════════════════════
+
+Preferences prefs;
+WiFiManager wm;
+WiFiManagerParameter paramApiKey("apikey", "API key do servidor", "", 80,
+                                 "placeholder=\"deixe em branco para manter a atual\"");
+String apiKey;
+
+WiFiClientSecure clienteTLS;
+WiFiClient clientePlano;
+
 unsigned long ultimoPoll = 0;
+unsigned long intervaloPoll = INTERVALO_POLL_MS;
 int proximaTranca = 0;
 
-// ─── Estrutura de cada tranca (sensor + 2 solenoides) ───
+const int8_t DESCONHECIDO = -1;   // ainda não leu o sensor com confiança
+const int8_t LIVRE        = 0;
+const int8_t OCUPADA      = 1;
+
 struct Tranca {
   int id;
   int pinoTrig;
   int pinoEcho;
-  int soleAberta;    // segura a tranca ABERTA. Pulso = solta e a tranca fecha
-  int soleFechada;   // segura a tranca FECHADA. Pulso = solta e a tranca abre
-  bool ocupada;      // estado lido pelo sensor
+  int soleAberta;      // segura a tranca ABERTA. Pulso = solta e a tranca fecha
+  int soleFechada;     // segura a tranca FECHADA. Pulso = solta e a tranca abre
+  int8_t estado;       // estado confirmado pelo sensor
+  uint8_t confirmacoes;        // leituras seguidas que contradizem o estado atual
+  bool pendente;               // true = servidor ainda não recebeu o estado atual
+  unsigned long proximaTentativa;
+  unsigned long ultimoOk;
   long ultimoComando;          // id do último comando já tratado
   bool comandoSincronizado;    // false até a 1ª leitura (evita executar comando antigo ao ligar)
 };
 
 Tranca trancas[] = {
-  //id trig echo sAberta sFechada ocupada ultCmd sinc
-  {1, 13, 14, 16, 17, true, 0, false},
-  {2, 18, 19, 25, 26, true, 0, false}
+  // id trig echo sAberta sFechada estado        cfm pend prox ok cmd sinc
+  {1, 13, 14, 16, 17, DESCONHECIDO, 0, false, 0, 0, 0, false},
+  {2, 18, 19, 25, 26, DESCONHECIDO, 0, false, 0, 0, 0, false}
 };
 const int NUM_TRANCAS = sizeof(trancas) / sizeof(trancas[0]);
 
-// ─── Funções de comunicação ─────────────────────────────
-void setEstacao(bool bloqueada) {
-  HTTPClient http;
-  http.begin(urlEstacao);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", apiKey);
+// ═══ PORTAL E BOTÃO ═════════════════════════════════════════════════════════
 
+void salvarApiKey() {
+  String nova = String(paramApiKey.getValue());
+  nova.trim();
+  if (nova.length() > 0 && nova != apiKey) {
+    apiKey = nova;
+    prefs.putString("apikey", apiKey);
+    Serial.println("API key atualizada.");
+  }
+}
+
+void abrirPortalConfig() {
+  Serial.println("\n>>> Abrindo portal de configuracao...");
+  Serial.printf("Conecte no WiFi \"%s\" (senha: %s) e abra 192.168.4.1\n", NOME_PORTAL, SENHA_PORTAL);
+  wm.setConfigPortalTimeout(180);
+  wm.startConfigPortal(NOME_PORTAL, SENHA_PORTAL);   // bloqueia até salvar ou expirar
+  salvarApiKey();
+  ESP.restart();
+}
+
+void verificarBotaoConfig() {
+  static unsigned long inicio = 0;
+  if (digitalRead(PINO_CONFIG) == LOW) {
+    if (inicio == 0) inicio = millis();
+    else if (millis() - inicio > TEMPO_BOTAO_MS) {
+      inicio = 0;
+      abrirPortalConfig();
+    }
+  } else {
+    inicio = 0;
+  }
+}
+
+// ═══ WIFI ═══════════════════════════════════════════════════════════════════
+
+void garantirWiFi() {
+  static unsigned long offlineDesde = 0;
+  static unsigned long ultimaTentativa = 0;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    offlineDesde = 0;
+    return;
+  }
+  if (offlineDesde == 0) offlineDesde = millis();
+  if (millis() - offlineDesde > OFFLINE_REINICIA_MS) {
+    Serial.println("Muito tempo sem WiFi. Reiniciando...");
+    ESP.restart();
+  }
+  if (millis() - ultimaTentativa < 10000) return;
+  ultimaTentativa = millis();
+  Serial.println("WiFi caiu. Tentando reconectar...");
+  WiFi.disconnect();
+  WiFi.reconnect();
+}
+
+// ═══ HTTP ═══════════════════════════════════════════════════════════════════
+
+// Explica no Serial o motivo do erro (é a principal pista quando algo não chega ao servidor)
+void logHttp(const char* quem, int code) {
+  const char* dica = "";
+  switch (code) {
+    case -100: dica = "sem WiFi"; break;
+    case -101: dica = "URL invalida (confira API_BASE)"; break;
+    case -102: dica = "API key vazia: segure BOOT por 3 s e configure no portal"; break;
+    case 301: case 302: case 307: case 308:
+      dica = "redirecionamento (confira http/https e a barra final da URL)"; break;
+    case 400: dica = "host nao permitido (ALLOWED_HOSTS) ou JSON recusado"; break;
+    case 401: case 403: dica = "API key ou login recusados (compare o tamanho/final da chave mostrado no boot com o do servidor)"; break;
+    case 404: dica = "rota ou ID nao existe no servidor"; break;
+    case 500: case 502: case 503: dica = "erro no servidor (veja os logs do Django/Nginx)"; break;
+    default:
+      if (code < 0) dica = "falha de conexao/TLS/DNS";
+      break;
+  }
+  if (code < 0 && code > -100) {
+    Serial.printf("[HTTP] %s -> %d (%s) %s\n", quem, code, HTTPClient::errorToString(code).c_str(), dica);
+  } else {
+    Serial.printf("[HTTP] %s -> %d %s\n", quem, code, dica);
+  }
+}
+
+// Faz GET/POST no servidor. Retorna o código HTTP (negativo = falha local).
+int requisicao(const char* metodo, const String &caminho, const String &corpo, String *resposta = nullptr) {
+  if (WiFi.status() != WL_CONNECTED) return -100;
+  if (apiKey.length() == 0) return -102;
+
+  String url = String(API_BASE) + caminho;
+  HTTPClient http;
+  http.setTimeout(4000);
+  http.setConnectTimeout(4000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  bool iniciou;
+  if (url.startsWith("https://")) {
+    clienteTLS.setInsecure();   // sem validar certificado (simples). Para validar, use setCACert().
+    iniciou = http.begin(clienteTLS, url);
+  } else {
+    iniciou = http.begin(clientePlano, url);
+  }
+  if (!iniciou) return -101;
+
+  http.addHeader("X-API-Key", apiKey);
+  int code;
+  if (strcmp(metodo, "POST") == 0) {
+    http.addHeader("Content-Type", "application/json");
+    code = http.POST(corpo);
+  } else {
+    code = http.GET();
+  }
+  if (code > 0) {
+    String corpoResp = http.getString();
+    // em caso de erro, mostra o que o servidor respondeu (costuma dizer o motivo)
+    if (code >= 400) Serial.printf("[HTTP] resposta do servidor: %.150s\n", corpoResp.c_str());
+    if (resposta != nullptr) *resposta = corpoResp;
+  }
+  http.end();
+  return code;
+}
+
+bool enviarEstacao(bool bloqueada) {
   StaticJsonDocument<64> doc;
   doc["bloqueada"] = bloqueada;
   String payload;
   serializeJson(doc, payload);
 
-  int httpCode = http.POST(payload);
-  if (httpCode == 200) {
+  int code = requisicao("POST", "/estacao/", payload);
+  if (code == 200 || code == 201) {
     Serial.println(bloqueada ? "-> API: Estacao BLOQUEADA" : "-> API: Estacao DESBLOQUEADA");
-  } else {
-    Serial.printf("Erro estacao: %d\n", httpCode);
+    return true;
   }
-  http.end();
+  logHttp("estacao", code);
+  return false;
 }
 
-void setTranca(int id_tranca, String estado, bool reservada) {
-  HTTPClient http;
-  http.begin(urlTranca);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", apiKey);
-
+bool enviarTranca(int id_tranca, const char* estado, bool reservada) {
   StaticJsonDocument<200> doc;
   doc["login"] = "esp32";
   doc["senha"] = "esp32";
@@ -82,45 +231,42 @@ void setTranca(int id_tranca, String estado, bool reservada) {
   String payload;
   serializeJson(doc, payload);
 
-  int httpCode = http.POST(payload);
-  if (httpCode == 200) {
-    Serial.printf("-> API: Tranca %d atualizada para %s\n", id_tranca, estado.c_str());
-  } else {
-    Serial.printf("Erro tranca: %d\n", httpCode);
+  int code = requisicao("POST", "/acesso/", payload);
+  if (code == 200 || code == 201) {
+    Serial.printf("-> API: Tranca %d atualizada para %s\n", id_tranca, estado);
+    return true;
   }
-  http.end();
+  logHttp("tranca", code);
+  return false;
 }
 
 // Lê o comando pendente da tranca no servidor.
 // Resposta esperada: {"comando": "fechar" | "abrir" | "", "comando_id": 17, ...}
 // Retorna false se não conseguiu consultar (nesse caso NADA é acionado).
 bool consultarComando(const Tranca &t, String &comando, long &comandoId) {
-  HTTPClient http;
-  http.setTimeout(3000);
-  http.begin(String(urlConsultaTranca) + t.id + "/");
-  http.addHeader("X-API-Key", apiKey);
-
-  int httpCode = http.GET();
-  if (httpCode != 200) {
-    Serial.printf("Erro consulta tranca %d: %d\n", t.id, httpCode);
-    http.end();
+  String resp;
+  int code = requisicao("GET", "/tranca/" + String(t.id) + "/", "", &resp);
+  if (code != 200) {
+    logHttp(("consulta tranca " + String(t.id)).c_str(), code);
     return false;
   }
 
   StaticJsonDocument<256> doc;
-  DeserializationError erro = deserializeJson(doc, http.getString());
-  http.end();
+  DeserializationError erro = deserializeJson(doc, resp);
   if (erro) {
     Serial.printf("Erro JSON tranca %d: %s\n", t.id, erro.c_str());
     return false;
   }
 
-  comando = doc["comando"] | "";
+  const char* c = doc["comando"] | "";
+  comando = String(c);
   comandoId = doc["comando_id"] | 0L;
   return true;
 }
 
-// ─── Leitura de distância (reutilizável p/ qualquer sensor) ──
+// ═══ SENSORES ═══════════════════════════════════════════════════════════════
+
+// Uma leitura do HC-SR04. Retorna 0 se não houve eco.
 float lerDistanciaCm(int trig, int echo) {
   digitalWrite(trig, LOW);
   delayMicroseconds(2);
@@ -132,30 +278,96 @@ float lerDistanciaCm(int trig, int echo) {
   return duracao * 0.034 / 2;                 // 0 se não houve eco
 }
 
-// ─── Estação só fica bloqueada se TODAS as trancas estiverem ocupadas ──
+// Mediana de 3 leituras: ignora leituras isoladas erradas (eco perdido, ruído).
+float medirDistanciaCm(int trig, int echo, float *bruto) {
+  float v[3];
+  for (int k = 0; k < 3; k++) {
+    v[k] = lerDistanciaCm(trig, echo);
+    bruto[k] = v[k];
+    delay(30);   // também evita um sensor captar o eco do outro
+  }
+  if (v[0] > v[1]) { float x = v[0]; v[0] = v[1]; v[1] = x; }
+  if (v[1] > v[2]) { float x = v[1]; v[1] = v[2]; v[2] = x; }
+  if (v[0] > v[1]) { float x = v[0]; v[0] = v[1]; v[1] = x; }
+  return v[1];
+}
+
+// Histerese: entre DIST_OCUPADA_CM e DIST_LIVRE_CM mantém o estado que já estava.
+int8_t classificar(const Tranca &t, float d) {
+  if (d > 0 && d <= DIST_OCUPADA_CM) return OCUPADA;
+  if (d == 0 || d >= DIST_LIVRE_CM) return LIVRE;
+  return t.estado;
+}
+
+const char* textoEstado(int8_t e) {
+  if (e == OCUPADA) return "OCUPADA";
+  if (e == LIVRE) return "LIVRE";
+  return "?";
+}
+
+// A estação só fica bloqueada se TODAS as trancas estiverem ocupadas
 bool todasOcupadas() {
   for (int i = 0; i < NUM_TRANCAS; i++) {
-    if (!trancas[i].ocupada) return false;
+    if (trancas[i].estado != OCUPADA) return false;
   }
   return true;
 }
 
-// ─── Ações dos sensores (mesma lógica que já funcionava) ─
-void trancar(Tranca &t) {
-  Serial.printf("\n>>> Tranca %d: objeto detectado! Trancando...\n", t.id);
-  setTranca(t.id, "fechada", false);
-  t.ocupada = true;
-  setEstacao(todasOcupadas());
+void atualizarTranca(Tranca &t) {
+  float bruto[3];
+  float d = medirDistanciaCm(t.pinoTrig, t.pinoEcho, bruto);
+  int8_t visto = classificar(t, d);
+
+  if (DEBUG_LEITURAS) {
+    Serial.printf("[Sensor %d] %.1f cm (brutas %.1f %.1f %.1f) | %s | confirmando %u/%u\n",
+                  t.id, d, bruto[0], bruto[1], bruto[2],
+                  textoEstado(t.estado), t.confirmacoes, CONFIRMACOES);
+  }
+
+  if (visto == DESCONHECIDO || visto == t.estado) {
+    t.confirmacoes = 0;
+    return;
+  }
+  if (++t.confirmacoes < CONFIRMACOES) return;
+
+  // mudança confirmada
+  t.estado = visto;
+  t.confirmacoes = 0;
+  t.pendente = true;                 // precisa avisar o servidor
+  t.proximaTentativa = millis();     // e já
+  Serial.printf("\n>>> Tranca %d: %s\n", t.id,
+                visto == OCUPADA ? "objeto detectado (OCUPADA)" : "sensor livre (LIVRE)");
 }
 
-void liberar(Tranca &t) {
-  Serial.printf("\n>>> Tranca %d: sensor livre! Liberando...\n", t.id);
-  setTranca(t.id, "aberta", false);
-  t.ocupada = false;
-  setEstacao(false);   // se uma está livre, a estação não está cheia
+// Envia ao servidor o estado das trancas. Só dá a mudança como entregue se o servidor
+// confirmar; se falhar, tenta de novo depois (antes o estado se perdia em silêncio).
+void sincronizarComServidor() {
+  unsigned long agora = millis();
+  for (int i = 0; i < NUM_TRANCAS; i++) {
+    Tranca &t = trancas[i];
+    if (t.estado == DESCONHECIDO) continue;
+
+    if (!t.pendente && HEARTBEAT_MS > 0 && agora - t.ultimoOk >= HEARTBEAT_MS) {
+      t.pendente = true;
+      t.proximaTentativa = agora;
+    }
+    if (!t.pendente) continue;
+    if ((long)(agora - t.proximaTentativa) < 0) continue;
+
+    bool ok = enviarTranca(t.id, t.estado == OCUPADA ? "fechada" : "aberta", false)
+              && enviarEstacao(todasOcupadas());
+    if (ok) {
+      t.pendente = false;
+      t.ultimoOk = millis();
+    } else {
+      t.proximaTentativa = millis() + RETRY_MS;
+      Serial.printf("   Tranca %d: nao entregue, nova tentativa em %lu s\n", t.id, RETRY_MS / 1000);
+    }
+  }
 }
 
-// ─── Ações das solenoides ───────────────────────────────
+// ═══ SOLENOIDES ═════════════════════════════════════════════════════════════
+
 void pulsarSolenoide(int pino) {
   digitalWrite(pino, SOLE_ATIVO);
   delay(TEMPO_PULSO_MS);
@@ -177,7 +389,7 @@ void abrirTranca(Tranca &t) {
 // Consulta uma tranca por vez (revezando) e executa o comando se for novo
 void verificarComandos() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (millis() - ultimoPoll < INTERVALO_POLL_MS) return;
+  if (millis() - ultimoPoll < intervaloPoll) return;
   ultimoPoll = millis();
 
   Tranca &t = trancas[proximaTranca];
@@ -185,7 +397,12 @@ void verificarComandos() {
 
   String comando;
   long comandoId;
-  if (!consultarComando(t, comando, comandoId)) return;   // erro: não aciona nada
+  if (!consultarComando(t, comando, comandoId)) {
+    // servidor fora do ar: espaça as consultas (até 10 s) para não travar o loop dos sensores
+    intervaloPoll = (intervaloPoll * 2 > 10000UL) ? 10000UL : intervaloPoll * 2;
+    return;
+  }
+  intervaloPoll = INTERVALO_POLL_MS;
 
   // Primeira leitura depois de ligar: só guarda o id, não executa comando antigo
   if (!t.comandoSincronizado) {
@@ -201,10 +418,16 @@ void verificarComandos() {
   else if (comando == "abrir") abrirTranca(t);
 }
 
-// ─── Setup ──────────────────────────────────────────────
+// ═══ SETUP ══════════════════════════════════════════════════════════════════
+
 void setup() {
   Serial.begin(115200);
   pinMode(LED, OUTPUT);
+  pinMode(PINO_CONFIG, INPUT_PULLUP);
+
+  // lê a API key salva na memória do ESP
+  prefs.begin("kakatua", false);
+  apiKey = prefs.getString("apikey", "");
 
   for (int i = 0; i < NUM_TRANCAS; i++) {
     pinMode(trancas[i].pinoTrig, OUTPUT);
@@ -219,40 +442,48 @@ void setup() {
     digitalWrite(trancas[i].soleFechada, SOLE_REPOUSO);
   }
 
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando ao WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  // Conecta no WiFi salvo. Se não houver (ou falhar), abre o portal de configuração.
+  wm.addParameter(&paramApiKey);
+  wm.setConnectTimeout(20);
+  wm.setConfigPortalTimeout(180);
+  Serial.println("Conectando ao WiFi (ou abrindo o portal de configuracao)...");
+  if (!wm.autoConnect(NOME_PORTAL, SENHA_PORTAL)) {
+    Serial.println("Nao conectou. Reiniciando...");
+    delay(1000);
+    ESP.restart();
   }
+  salvarApiKey();
+  WiFi.setAutoReconnect(true);
+
   Serial.println(" Conectado!");
+  Serial.printf("Servidor: %s\n", API_BASE);
+  if (apiKey.length() == 0) {
+    Serial.println("ATENCAO: API key nao configurada. Segure o BOOT por 3 s para abrir o portal.");
+  } else {
+    // para comparar com a chave do servidor sem mostrar a chave inteira
+    unsigned int n = apiKey.length();
+    Serial.printf("API key salva: %u caracteres, termina em \"%s\"\n",
+                  n, apiKey.substring(n > 3 ? n - 3 : 0).c_str());
+  }
   Serial.println("-------------------------------------");
   Serial.println("Aguardando deteccao por sensores ultrassonicos...");
   Serial.println("-------------------------------------");
 }
 
-// ─── Loop ───────────────────────────────────────────────
+// ═══ LOOP ═══════════════════════════════════════════════════════════════════
+
 void loop() {
-  bool algumDetectado = false;
+  verificarBotaoConfig();   // segurar o BOOT por 3 s abre o portal de configuração
+  garantirWiFi();
 
+  bool algumaOcupada = false;
   for (int i = 0; i < NUM_TRANCAS; i++) {
-    Tranca &t = trancas[i];
-    float dist = lerDistanciaCm(t.pinoTrig, t.pinoEcho);
-
-    Serial.printf("[Sensor %d] %.1f cm | %s\n", t.id, dist,
-                  t.ocupada ? "OCUPADA" : "LIVRE");
-
-    bool detectado = (dist > 0 && dist <= 10);
-    if (detectado) algumDetectado = true;
-
-    if (detectado && !t.ocupada)      trancar(t);
-    else if (!detectado && t.ocupada) liberar(t);
-
-    delay(50);  // evita um sensor captar o eco do outro
+    atualizarTranca(trancas[i]);
+    if (trancas[i].estado == OCUPADA) algumaOcupada = true;
   }
+  digitalWrite(LED, algumaOcupada ? HIGH : LOW);
 
-  digitalWrite(LED, algumDetectado ? HIGH : LOW);
-
-  verificarComandos();   // lê comandos do servidor e aciona as solenoides
-  delay(100);
+  sincronizarComServidor();   // avisa o servidor (com nova tentativa se falhar)
+  verificarComandos();        // lê comandos do servidor e aciona as solenoides
+  delay(50);
 }
