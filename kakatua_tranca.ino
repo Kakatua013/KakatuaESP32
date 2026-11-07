@@ -3,6 +3,8 @@
 #include <WiFiManager.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include <SPI.h>
+#include <MFRC522.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
@@ -45,6 +47,18 @@ const unsigned long OFFLINE_REINICIA_MS = 300000;  // reinicia o ESP se ficar 5 
 // Consulta de comandos
 const unsigned long INTERVALO_POLL_MS = 1000;   // uma tranca consultada a cada 1 s (revezando)
 
+// Leitor RFID (RC522). Alimente em 3,3 V (NUNCA em 5 V).
+// Pinos escolhidos para não colidir com sensores (13,14,18,19), solenoides (16,17,25,26) e LED (21).
+const int PINO_RFID_SCK  = 27;
+const int PINO_RFID_MISO = 32;
+const int PINO_RFID_MOSI = 33;
+const int PINO_RFID_SS   = 4;     // pino SDA/SS do módulo
+const int PINO_RFID_RST  = 22;
+// Estação onde o leitor fica. 0 = um leitor para todas as estações: o servidor escolhe
+// (guarda na 1ª estação livre; libera a estação que for do dono da tag).
+const int ID_TRANCA_LEITOR = 0;
+const unsigned long RFID_REPETE_MS = 3000;   // ignora a mesma tag lida de novo dentro desse tempo
+
 // ═══ ESTADO GLOBAL ══════════════════════════════════════════════════════════
 
 Preferences prefs;
@@ -52,6 +66,16 @@ WiFiManager wm;
 WiFiManagerParameter paramApiKey("apikey", "API key do servidor", "", 80,
                                  "placeholder=\"deixe em branco para manter a atual\"");
 String apiKey;
+
+// Endereço do site (Django) que recebe as leituras de tag. Configurado pelo portal.
+WiFiManagerParameter paramSite("site", "Endereco do site (ex.: https://kakatua.exemplo.com.br)", "", 100,
+                               "placeholder=\"deixe em branco para manter o atual\"");
+String siteBase;
+
+MFRC522 rfid(PINO_RFID_SS, PINO_RFID_RST);
+bool rfidOk = false;
+String ultimaTag;
+unsigned long ultimaTagEm = 0;
 
 WiFiClientSecure clienteTLS;
 WiFiClient clientePlano;
@@ -88,13 +112,22 @@ const int NUM_TRANCAS = sizeof(trancas) / sizeof(trancas[0]);
 
 // ═══ PORTAL E BOTÃO ═════════════════════════════════════════════════════════
 
-void salvarApiKey() {
+void salvarConfig() {
   String nova = String(paramApiKey.getValue());
   nova.trim();
   if (nova.length() > 0 && nova != apiKey) {
     apiKey = nova;
     prefs.putString("apikey", apiKey);
     Serial.println("API key atualizada.");
+  }
+
+  String site = String(paramSite.getValue());
+  site.trim();
+  while (site.endsWith("/")) site.remove(site.length() - 1);
+  if (site.length() > 0 && site != siteBase) {
+    siteBase = site;
+    prefs.putString("site", siteBase);
+    Serial.printf("Endereco do site atualizado: %s\n", siteBase.c_str());
   }
 }
 
@@ -103,7 +136,7 @@ void abrirPortalConfig() {
   Serial.printf("Conecte no WiFi \"%s\" (senha: %s) e abra 192.168.4.1\n", NOME_PORTAL, SENHA_PORTAL);
   wm.setConfigPortalTimeout(180);
   wm.startConfigPortal(NOME_PORTAL, SENHA_PORTAL);   // bloqueia até salvar ou expirar
-  salvarApiKey();
+  salvarConfig();
   ESP.restart();
 }
 
@@ -169,13 +202,14 @@ void logHttp(const char* quem, int code) {
 }
 
 // Faz GET/POST no servidor. Retorna o código HTTP (negativo = falha local).
-int requisicao(const char* metodo, const String &caminho, const String &corpo, String *resposta = nullptr) {
+int requisicao(const char* metodo, const String &caminho, const String &corpo, String *resposta = nullptr,
+               const String *base = nullptr, uint16_t timeoutMs = 4000) {
   if (WiFi.status() != WL_CONNECTED) return -100;
   if (apiKey.length() == 0) return -102;
 
-  String url = String(API_BASE) + caminho;
+  String url = (base != nullptr ? *base : String(API_BASE)) + caminho;
   HTTPClient http;
-  http.setTimeout(4000);
+  http.setTimeout(timeoutMs);
   http.setConnectTimeout(4000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
@@ -418,6 +452,96 @@ void verificarComandos() {
   else if (comando == "abrir") abrirTranca(t);
 }
 
+// ═══ LEITOR RFID ════════════════════════════════════════════════════════════
+
+void iniciarRFID() {
+  SPI.begin(PINO_RFID_SCK, PINO_RFID_MISO, PINO_RFID_MOSI, PINO_RFID_SS);
+  rfid.PCD_Init();
+  byte v = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  rfidOk = (v != 0x00 && v != 0xFF);
+  if (rfidOk) {
+    Serial.printf("RFID: leitor encontrado (versao 0x%02X)\n", v);
+  } else {
+    Serial.println("RFID: leitor NAO encontrado (confira a fiacao e a alimentacao de 3,3 V)");
+  }
+}
+
+// Retorno visual para o usuário: n piscadas de ms cada
+void piscarLED(int n, int ms) {
+  for (int i = 0; i < n; i++) {
+    digitalWrite(LED, HIGH);
+    delay(ms);
+    digitalWrite(LED, LOW);
+    delay(ms);
+  }
+}
+
+// Lê uma tag (se houver) e devolve o UID em hexadecimal maiúsculo; "" se não houver
+String lerTag() {
+  if (!rfidOk) return "";
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return "";
+
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  return uid;
+}
+
+// Manda o UID ao site. O site decide: cadastrar a tag, guardar a bike ou liberar a estação.
+void enviarTag(const String &uid) {
+  if (siteBase.length() == 0) {
+    Serial.println("Tag lida, mas o endereco do site nao esta configurado (segure BOOT por 3 s).");
+    piscarLED(3, 80);
+    return;
+  }
+
+  StaticJsonDocument<96> doc;
+  doc["uid"] = uid;
+  doc["id_tranca"] = ID_TRANCA_LEITOR;
+  String payload;
+  serializeJson(doc, payload);
+
+  String resp;
+  // tempo maior: o site ainda consulta/comanda o servidor das trancas antes de responder
+  int code = requisicao("POST", "/api/tag/", payload, &resp, &siteBase, 12000);
+  if (code != 200) {
+    logHttp("tag", code);
+    piscarLED(1, 600);
+    return;
+  }
+
+  StaticJsonDocument<256> r;
+  if (deserializeJson(r, resp)) {
+    Serial.println("Resposta invalida do site.");
+    piscarLED(1, 600);
+    return;
+  }
+  const char* resultado = r["resultado"] | "";
+  const char* mensagem = r["mensagem"] | "";
+  Serial.printf("[Tag %s] %s: %s\n", uid.c_str(), resultado, mensagem);
+
+  bool ok = strcmp(resultado, "cadastrada") == 0 || strcmp(resultado, "guardada") == 0 ||
+            strcmp(resultado, "liberada") == 0;
+  if (ok) piscarLED(2, 120);    // 2 piscadas rápidas = deu certo
+  else    piscarLED(1, 600);    // 1 piscada longa = recusada/desconhecida
+}
+
+void verificarTag() {
+  String uid = lerTag();
+  if (uid.length() == 0) return;
+  if (uid == ultimaTag && millis() - ultimaTagEm < RFID_REPETE_MS) return;   // leitura repetida
+  ultimaTag = uid;
+
+  Serial.printf("\n>>> Tag lida: %s\n", uid.c_str());
+  enviarTag(uid);
+  ultimaTagEm = millis();
+}
+
 // ═══ SETUP ══════════════════════════════════════════════════════════════════
 
 void setup() {
@@ -428,6 +552,7 @@ void setup() {
   // lê a API key salva na memória do ESP
   prefs.begin("kakatua", false);
   apiKey = prefs.getString("apikey", "");
+  siteBase = prefs.getString("site", "");
 
   for (int i = 0; i < NUM_TRANCAS; i++) {
     pinMode(trancas[i].pinoTrig, OUTPUT);
@@ -442,8 +567,11 @@ void setup() {
     digitalWrite(trancas[i].soleFechada, SOLE_REPOUSO);
   }
 
+  iniciarRFID();
+
   // Conecta no WiFi salvo. Se não houver (ou falhar), abre o portal de configuração.
   wm.addParameter(&paramApiKey);
+  wm.addParameter(&paramSite);
   wm.setConnectTimeout(20);
   wm.setConfigPortalTimeout(180);
   Serial.println("Conectando ao WiFi (ou abrindo o portal de configuracao)...");
@@ -452,11 +580,16 @@ void setup() {
     delay(1000);
     ESP.restart();
   }
-  salvarApiKey();
+  salvarConfig();
   WiFi.setAutoReconnect(true);
 
   Serial.println(" Conectado!");
   Serial.printf("Servidor: %s\n", API_BASE);
+  if (siteBase.length() == 0) {
+    Serial.println("ATENCAO: endereco do site nao configurado (leitor de tag desativado). Segure o BOOT por 3 s.");
+  } else {
+    Serial.printf("Site: %s\n", siteBase.c_str());
+  }
   if (apiKey.length() == 0) {
     Serial.println("ATENCAO: API key nao configurada. Segure o BOOT por 3 s para abrir o portal.");
   } else {
@@ -483,6 +616,7 @@ void loop() {
   }
   digitalWrite(LED, algumaOcupada ? HIGH : LOW);
 
+  verificarTag();             // leitor RFID: cadastra/guarda/libera pela tag
   sincronizarComServidor();   // avisa o servidor (com nova tentativa se falhar)
   verificarComandos();        // lê comandos do servidor e aciona as solenoides
   delay(50);
